@@ -1,0 +1,125 @@
+#!/bin/bash
+# speak-watch — speak stdout updates only after output goes quiet.
+# Like `watch`, but for voice: debounces a stream and speaks the last line
+# (default) or all lines since the previous announcement (delta mode).
+#
+# Usage:
+#   some-command | speak-watch [voice] [quiet_secs] [-d|--delta] [-l|--last]
+#   tail -f build.log | speak-watch alan 2
+#   speak-watch -d              # delta mode, default voice, 1s quiet
+#
+# Options:
+#   voice       numeric index (1-based) or short name, e.g. alan, alba
+#   quiet_secs  seconds of silence before speaking (default 1; invalid -> 1)
+#   -d, --delta speak all lines since the last announcement
+#   -l, --last  speak only the last line (default)
+# Env:
+#   SPEAK_WATCH_MAX_CHARS  truncate spoken text to N chars (default 300)
+#   SPEAK_WATCH_STUB       set to a command to receive text instead of TTS
+#                          (for testing; receives text on stdin)
+set -uo pipefail
+
+SPEAK="$HOME/.local/bin/speak"
+PIPER_DIR="$HOME/.local/share/piper"
+MAX_CHARS="${SPEAK_WATCH_MAX_CHARS:-300}"
+
+mode="last"
+voice=""
+quiet="1"
+positional=()
+
+for arg in "$@"; do
+	case "$arg" in
+		-d|--delta) mode="delta" ;;
+		-l|--last) mode="last" ;;
+		-h|--help)
+			sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+			exit 0
+			;;
+		-*)
+			echo "Unknown option: $arg" >&2
+			exit 1
+			;;
+		*)
+			positional+=("$arg")
+			;;
+	esac
+done
+voice="${positional[0]:-}"
+quiet="${positional[1]:-1}"
+[[ "$quiet" =~ ^[0-9]+([.][0-9]+)?$ ]] || quiet="1"
+# read -t 0 polls without blocking and would spin; clamp to a small minimum
+[ $(python3 -c "print(1 if float('$quiet') < 0.05 else 0)") = 1 ] && quiet="0.05"
+
+speak_text() {
+	local text="$1"
+	if [ -n "${SPEAK_WATCH_STUB:-}" ]; then
+		printf '%s\n' "$text" | $SPEAK_WATCH_STUB
+		return
+	fi
+	[ -x "$SPEAK" ] || { echo "speak.sh not found: $SPEAK" >&2; return 1; }
+	printf '%s' "$text" | "$SPEAK" "$voice"
+}
+
+# validate voice up front when not stubbed (fail fast, exit nonzero)
+if [ -z "${SPEAK_WATCH_STUB:-}" ] && [ -n "$voice" ]; then
+	voices=($(cd "$PIPER_DIR" 2>/dev/null && ls *.onnx 2>/dev/null || true))
+	ok=""
+	if [[ "$voice" =~ ^[0-9]+$ ]] && [ "$voice" -ge 1 ] && [ "$voice" -le ${#voices[@]} ]; then
+		ok="${voices[$((voice-1))]}"
+	elif [ -f "$PIPER_DIR/$voice.onnx" ]; then
+		ok="$voice"
+	else
+		matches=()
+		for v in "${voices[@]}"; do
+			case "$v" in *"$voice"*) matches+=("$v") ;; esac
+		done
+		if [ ${#matches[@]} -eq 1 ]; then ok="${matches[0]}"; fi
+	fi
+	if [ -z "$ok" ]; then
+		echo "Voice '$voice' not found or ambiguous. Available:" >&2
+		printf '  %s\n' "${voices[@]}" >&2
+		exit 1
+	fi
+fi
+
+flush_burst() {
+	local burst="$1" text
+	if [ "$mode" = "delta" ]; then
+		text=$(printf '%b' "$burst" | tr '\n' ' ')
+	else
+		text=$(printf '%b' "$burst" | tail -n 1)
+	fi
+	text=$(printf '%s' "$text" \
+		| sed -E 's/[|`#*_~]+//g; s/https?:\/\/[^ ]+/link/g; s/([0-9]+)%/\1 percent/g; s/[[:space:]]+$//')
+	[ ${#text} -gt "$MAX_CHARS" ] && text="${text:0:$MAX_CHARS}"
+	[ -n "$text" ] && speak_text "$text"
+}
+
+# Debounce: speak the pending burst once `quiet` seconds pass with no new
+# input. Each arriving line restarts the quiet window. EOF flushes and exits.
+line=""
+burst=""
+deadline="$quiet"
+while :; do
+	if IFS= read -r -t "$deadline" line; then
+		[ -n "$line" ] && burst="${burst:+$burst\n}$line"
+		deadline="$quiet"
+	else
+		ret=$?
+		# final line without trailing newline: read fails but keeps text
+		[ -n "$line" ] && burst="${burst:+$burst\n}$line"
+		line=""
+		if [ $ret -gt 128 ]; then
+			# quiet window elapsed -> speak burst, keep watching
+			if [ -n "$burst" ]; then
+				flush_burst "$burst"
+				burst=""
+			fi
+		else
+			# EOF: flush what remains and stop
+			[ -n "$burst" ] && flush_burst "$burst"
+			exit 0
+		fi
+	fi
+done

@@ -11,7 +11,7 @@ usage() {
 	echo "  voice: numeric index (1-based, see list below) or short name, e.g. alan, alba"
 	echo "  speaker: numeric speaker id (0-based); must be < num_speakers of the chosen voice, defaults to 0"
 	echo "  available voices:"
-	echo "$voices" | nl -w2 -s"  " -v1
+	(cd "$dir" && ls *.onnx 2>/dev/null || true)|nl -w2 -s"    " -v1   
 }
 
 find_voice() {
@@ -61,7 +61,7 @@ find_voice() {
 
 find_speaker() {
 	local voice_file="$1"
-	num_speakers=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("num_speakers", 1)))' "$dir/$voice_file.onnx.json" 2>/dev/null || echo 1)
+	num_speakers=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("num_speakers", 1)))' "$dir/$voice_file.json" 2>/dev/null || echo 1)
 	if [ -z "${2:-}" ]; then
 		speaker=0
 	elif [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -lt "$num_speakers" ] 2>/dev/null; then
